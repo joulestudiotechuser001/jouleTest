@@ -1,0 +1,10 @@
+apiVersion: solution.sap/v1
+kind: Solution
+
+metadata:
+  name: hello-world-agent-a9322
+  version: 1.0.0
+  description: A minimal AI agent that replies with Hello World to any input message.
+
+assets:
+  - ref: ./assets/hello-world-agent/asset.yaml
