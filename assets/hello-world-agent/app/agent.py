@@ -4,22 +4,14 @@ from typing import Any, AsyncGenerator, Literal, Sequence
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from langchain_litellm import ChatLiteLLM
 from langgraph.graph.state import CompiledStateGraph
 from litellm.exceptions import APIConnectionError, APIError, Timeout
-from opentelemetry import trace
 from sap_cloud_sdk.agent_decorators import agent_config, agent_model, prompt_section
-try:
-    from sap_cloud_sdk.agent_memory.factory.langgraph_checkpoint import create_checkpointer
-except ImportError:
-    def create_checkpointer(**kwargs):
-        return None
-
-from mcp_tools import get_user_sub
-
-tracer = trace.get_tracer(__name__)
+from sap_cloud_sdk.agent_memory.factory.langgraph_checkpoint import create_checkpointer
+from mcp_providers.agw import get_user_sub
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +51,27 @@ def get_temperature() -> float:
 def thread_ttl_seconds() -> int:
     return 3600 # 1 hour
 
+@agent_config(
+    key="config.summarization.trigger_tokens",
+    label="Summarization Trigger (tokens)",
+    description="Summarize conversation history once it exceeds this many tokens. "
+                "History is NOT covered by prompt caching, so a high trigger means "
+                "the full raw transcript is re-sent on every turn until it fires. "
+                "Lower this to bound per-turn cost; raise it to keep more raw context.",
+)
+def summarization_trigger_tokens() -> int:
+    return 30_000
+
+@agent_model(
+    key="config.summarization.model",
+    label="Summarization Model",
+    description="Model used to summarize conversation history. Summarization is a "
+                "cheaper task than the agent's own reasoning, so a smaller/faster "
+                "model is used here to reduce cost.",
+)
+def get_summarization_model_name() -> str:
+    return "sap/anthropic--claude-4.5-haiku"
+
 @prompt_section(
     key="prompts.system",
     label="System Prompt",
@@ -66,7 +79,9 @@ def thread_ttl_seconds() -> int:
     validation={"format": "markdown", "max_length": 5000},
 )
 def get_system_prompt() -> str:
-    return """You always respond with exactly 'Hello World' regardless of any input. Do not add any other text."""
+    return """Always respond with exactly: Hello World
+
+No matter what the user says, your only response is: Hello World"""
 
 
 @dataclass
@@ -84,17 +99,41 @@ class SampleAgent:
         self._fallback_model = get_fallback_model_name().strip()
         self._temperature = get_temperature()
 
-        self.llm = ChatLiteLLM(model=self._primary_model, temperature=self._temperature)
+        # cache_control_injection_points is picked up by litellm's AnthropicCacheControlHook,
+        # which injects a cache breakpoint on the system message before every API call.
+        # This caches the static prefix (system prompt + tool schemas) at 0.1× input cost
+        # on cache-hit turns. No beta header required as of current litellm/Anthropic versions.
+        _cache_kwargs = {
+            "cache_control_injection_points": [
+                {"location": "message", "role": "system", "control": {"type": "ephemeral"}}
+            ]
+        }
+        self.llm = ChatLiteLLM(
+            model=self._primary_model,
+            temperature=self._temperature,
+            model_kwargs=_cache_kwargs,
+        )
         self._fallback_llm = (
-            ChatLiteLLM(model=self._fallback_model, temperature=self._temperature)
+            ChatLiteLLM(
+                model=self._fallback_model,
+                temperature=self._temperature,
+                model_kwargs=_cache_kwargs,
+            )
             if self._fallback_model
             else None
         )
-
         self._checkpointer = create_checkpointer(ttl_seconds=ttl or None)
+        # Summarization compresses history once it exceeds the token trigger, keeping only
+        # the last N messages in full. This intentionally invalidates the prompt cache when
+        # it fires (the summarized history is new content), but the static prefix —
+        # system prompt + tool schemas, marked cacheable via cache_control_injection_points
+        # on self.llm — stays cacheable across all turns, summarized or not.
+        summarization_llm = ChatLiteLLM(
+            model=get_summarization_model_name(), temperature=0.0
+        )
         self._summarization_middleware = SummarizationMiddleware(
-            model=self.llm,
-            trigger=("tokens", 100_000),
+            model=summarization_llm,
+            trigger=("tokens", summarization_trigger_tokens()),
             keep=("messages", 4),
         )
 
@@ -119,10 +158,11 @@ class SampleAgent:
         system_prompt: str,
         query: str,
         context_id: str,
+        extra_messages: list | None = None,
     ) -> dict[str, Any]:
         """Invoke the agent and fall back only for transient LLM failures."""
         config = {"configurable": {"thread_id": f"{get_user_sub()}:{context_id}"}}
-        messages = {"messages": [HumanMessage(content=query)]}
+        messages = {"messages": (extra_messages or []) + [HumanMessage(content=query)]}
 
         try:
             graph = self._create_graph(self.llm, tools, system_prompt)
@@ -146,25 +186,6 @@ class SampleAgent:
             self._primary_model,
         )
         return result
-
-    @tracer.start_as_current_span("m1-agent-invoked")
-    async def _run_agent(self, query: str) -> str:
-        """Core Hello World logic with M1 and M2 milestone instrumentation."""
-        # M1 – Agent Invoked
-        if not query and query != "":
-            logger.warning("M1.missed: agent did not receive or parse the incoming request")
-            return "Hello World"
-
-        logger.info("M1.achieved: agent received incoming request")
-
-        try:
-            # M2 – Response Generated
-            response = "Hello World"
-            logger.info("M2.achieved: Hello World response generated successfully")
-            return response
-        except Exception:
-            logger.exception("M2.missed: response generation step did not complete")
-            raise
 
     async def stream(
         self,
@@ -192,18 +213,39 @@ class SampleAgent:
         }
 
         try:
-            response = await self._run_agent(query)
+            system_prompt = get_system_prompt()
+            tool_names = [tool.name for tool in tools] if tools else []
+            logger.info("Running agent with %d tool(s): %s", len(tool_names), tool_names)
 
-            # M3 – Response Delivered
+            # When no tools are available, inject a notice as a per-turn system message
+            # rather than mutating system_prompt, so the static prefix stays cache-stable.
+            extra: list = []
+            if not tools:
+                extra.append(
+                    SystemMessage(
+                        content="IMPORTANT: No tools are currently available. "
+                        "Do not attempt to call any tools. Respond to the user "
+                        "explaining that tools are temporarily unavailable."
+                    )
+                )
+
+            result = await self._invoke_with_fallback(
+                tools=tools or [],
+                system_prompt=system_prompt,
+                query=query,
+                context_id=context_id,
+                extra_messages=extra or None,
+            )
+            response = result["messages"][-1].content
+
             yield {
                 "is_task_complete": True,
                 "require_user_input": False,
                 "content": response,
             }
-            logger.info("M3.achieved: Hello World response delivered to caller")
 
         except Exception:
-            logger.exception("M3.missed: response delivery did not complete")
+            logger.exception("Agent stream() failed")
             yield {
                 "is_task_complete": True,
                 "require_user_input": False,

@@ -17,39 +17,14 @@ from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from agent_executor import AgentExecutor
-from mcp_tools import reset_user_token, set_user_token
-try:
-    from opentelemetry.instrumentation.starlette import StarletteInstrumentor
-    _starlette_instrumentation_available = True
-except ImportError:
-    _starlette_instrumentation_available = False
+from mcp_providers.agw import set_user_token, reset_user_token
+from opentelemetry.instrumentation.starlette import StarletteInstrumentor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "5000"))
-
-
-class JWTContextMiddleware(BaseHTTPMiddleware):
-    """Middleware that extracts JWT token from Authorization header and sets it in context."""
-
-    async def dispatch(self, request, call_next):
-        # Extract JWT token from Authorization header
-        auth_header = request.headers.get("authorization", "")
-        token = None
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header[7:]  # Remove "Bearer " prefix
-
-        # Set the token in the context variable, capturing the reset token
-        token_ctx = set_user_token(token)
-
-        try:
-            response = await call_next(request)
-            return response
-        finally:
-            # Restore the previous context value to prevent cross-request leakage
-            reset_user_token(token_ctx)
 
 
 @click.command()
@@ -59,13 +34,13 @@ def main(host: str, port: int):
     skill = AgentSkill(
         id="hello-world-agent",
         name="hello-world-agent",
-        description="A minimal AI agent that replies with Hello World to any input message.",
+        description="A simple AI agent that replies with Hello World to any user message.",
         tags=["hello", "world", "agent"],
-        examples=["Say hello", "What do you respond with?"],
+        examples=["Hello", "Say hello to me"],
     )
     agent_card = AgentCard(
         name="hello-world-agent",
-        description="A minimal AI agent that replies with Hello World to any input message.",
+        description="A simple AI agent that replies with Hello World to any user message.",
         url=os.environ.get("AGENT_PUBLIC_URL", f"http://{host}:{port}/"),
         version="1.0.0",
         default_input_modes=["text", "text/plain"],
@@ -82,11 +57,21 @@ def main(host: str, port: int):
     )
     app = server.build()
 
-    # Add JWT context middleware
+    class JWTContextMiddleware(BaseHTTPMiddleware):
+        """Extracts JWT token from Authorization header and sets it in context."""
+
+        async def dispatch(self, request, call_next):
+            auth_header = request.headers.get("authorization", "")
+            token = auth_header[7:] if auth_header.lower().startswith("bearer ") else None
+            token_ctx = set_user_token(token)
+            try:
+                return await call_next(request)
+            finally:
+                reset_user_token(token_ctx)
+
     app.add_middleware(JWTContextMiddleware)
 
-    if _starlette_instrumentation_available:
-        StarletteInstrumentor().instrument_app(app)
+    StarletteInstrumentor().instrument_app(app)
 
     logger.info(f"Starting A2A server at http://{host}:{port}")
     uvicorn.run(app, host=host, port=port)
