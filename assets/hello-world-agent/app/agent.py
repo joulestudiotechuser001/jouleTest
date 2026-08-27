@@ -1,6 +1,7 @@
 import logging
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Literal, Sequence
+from opentelemetry import trace
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
@@ -14,6 +15,7 @@ from sap_cloud_sdk.agent_memory.factory.langgraph_checkpoint import create_check
 from mcp_providers.agw import get_user_sub
 
 logger = logging.getLogger(__name__)
+tracer = trace.get_tracer(__name__)
 
 
 @agent_model(
@@ -79,7 +81,7 @@ def get_summarization_model_name() -> str:
     validation={"format": "markdown", "max_length": 5000},
 )
 def get_system_prompt() -> str:
-    return "You are a simple assistant. Respond to any user message with exactly: Hello World"
+    return """You are a Hello World agent. Respond to every user message with exactly: Hello World"""
 
 
 @dataclass
@@ -185,6 +187,48 @@ class SampleAgent:
         )
         return result
 
+    async def _run_agent(
+        self,
+        query: str,
+        context_id: str,
+        tools: Sequence[BaseTool] | None = None,
+    ) -> dict:
+        """Run the agent and return the final result with milestone instrumentation."""
+        # M1: Message Received
+        with tracer.start_as_current_span("M1_message_received"):
+            logger.info("M1.achieved: user message received")
+        # M2: Message Processed
+        with tracer.start_as_current_span("M2_message_processed"):
+            system_prompt = get_system_prompt()
+            tool_names = [tool.name for tool in tools] if tools else []
+            logger.info("Running agent with %d tool(s): %s", len(tool_names), tool_names)
+            extra: list = []
+            if not tools:
+                extra.append(
+                    SystemMessage(
+                        content="IMPORTANT: No tools are currently available. "
+                        "Do not attempt to call any tools. Respond to the user "
+                        "explaining that tools are temporarily unavailable."
+                    )
+                )
+            try:
+                result = await self._invoke_with_fallback(
+                    tools=tools or [],
+                    system_prompt=system_prompt,
+                    query=query,
+                    context_id=context_id,
+                    extra_messages=extra or None,
+                )
+                logger.info("M2.achieved: message processed successfully")
+            except Exception:
+                logger.error("M2.missed: message processing failed")
+                raise
+        # M3: Response Sent
+        with tracer.start_as_current_span("M3_response_sent"):
+            response = result["messages"][-1].content
+            logger.info("M3.achieved: Hello World response sent")
+        return {"response": response}
+
     async def stream(
         self,
         query: str,
@@ -211,39 +255,16 @@ class SampleAgent:
         }
 
         try:
-            system_prompt = get_system_prompt()
-            tool_names = [tool.name for tool in tools] if tools else []
-            logger.info("Running agent with %d tool(s): %s", len(tool_names), tool_names)
-
-            # When no tools are available, inject a notice as a per-turn system message
-            # rather than mutating system_prompt, so the static prefix stays cache-stable.
-            extra: list = []
-            if not tools:
-                extra.append(
-                    SystemMessage(
-                        content="IMPORTANT: No tools are currently available. "
-                        "Do not attempt to call any tools. Respond to the user "
-                        "explaining that tools are temporarily unavailable."
-                    )
-                )
-
-            result = await self._invoke_with_fallback(
-                tools=tools or [],
-                system_prompt=system_prompt,
-                query=query,
-                context_id=context_id,
-                extra_messages=extra or None,
-            )
-            response = result["messages"][-1].content
-
+            result = await self._run_agent(query, context_id, tools=tools)
             yield {
                 "is_task_complete": True,
                 "require_user_input": False,
-                "content": response,
+                "content": result["response"],
             }
 
         except Exception:
             logger.exception("Agent stream() failed")
+            logger.error("M3.missed: response was not sent")
             yield {
                 "is_task_complete": True,
                 "require_user_input": False,
