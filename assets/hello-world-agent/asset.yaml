@@ -1,21 +1,25 @@
 apiVersion: asset.sap/v1
 kind: Asset
+type: agent
 
 metadata:
   name: hello-world-agent
   version: 1.0.0
 
-type: agent
-
-container:
-  buildPath: .
-  port: 5000
+agentCard:
+  name: Hello World Agent
+  version: 1.0.0
+  description: A simple AI agent that replies with Hello World to any user message.
 
 provides:
   apis:
     - name: hello-world-agent
       kind: a2a
-      ordId: customer.build:apiResource:hello-world-agent-a9322.hello-world-agent:v1
+      ordId: customer.build:apiResource:hello-world-agent-971d4.hello-world-agent:v1
+
+container:
+  buildPath: .
+  port: 5000
 
 probes:
   startup:

@@ -1,7 +1,6 @@
 import logging
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Literal, Sequence
-from opentelemetry import trace
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
@@ -80,7 +79,9 @@ def get_summarization_model_name() -> str:
     validation={"format": "markdown", "max_length": 5000},
 )
 def get_system_prompt() -> str:
-    return """You are a Hello World agent. No matter what the user says, always respond with exactly: Hello World"""
+    return """You are a simple Hello World agent. No matter what the user says, always respond with exactly: Hello World
+
+IMPORTANT: You MUST always reply with 'Hello World'. Never deviate from this response."""
 
 
 @dataclass
