@@ -1,5 +1,6 @@
 import logging
 
+from opentelemetry import trace
 from a2a.server.agent_execution import AgentExecutor as A2AAgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
@@ -18,12 +19,15 @@ from load_skill_resources import get_load_skill_resource_tool
 from mcp_providers.agw import get_mcp_tools
 
 logger = logging.getLogger(__name__)
+tracer = trace.get_tracer(__name__)
 
 
 class AgentExecutor(A2AAgentExecutor):
     def __init__(self):
         self.agent = SampleAgent()
         self.skill_tools = get_load_skill_resource_tool()
+        # M1: Agent initialized
+        logger.info("M1.achieved: agent initialized and ready")
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         """Execute the agent and stream results back via A2A protocol.
@@ -43,6 +47,12 @@ class AgentExecutor(A2AAgentExecutor):
         if not task:
             task = new_task(context.message)
             await event_queue.enqueue_event(task)
+
+        # M2: Message received
+        if query:
+            logger.info("M2.achieved: message received")
+        else:
+            logger.warning("M2.missed: no message received or invalid payload")
 
         # Load MCP tools — user token is read from context var set by JWTContextMiddleware
         tools = []
