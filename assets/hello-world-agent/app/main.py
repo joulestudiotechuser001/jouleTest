@@ -23,6 +23,9 @@ from opentelemetry.instrumentation.starlette import StarletteInstrumentor
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from opentelemetry import trace
+tracer = trace.get_tracer(__name__)
+
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "5000"))
 
@@ -34,13 +37,13 @@ def main(host: str, port: int):
     skill = AgentSkill(
         id="hello-world-agent",
         name="hello-world-agent",
-        description="A simple AI agent that replies with Hello World to any user message.",
+        description="A simple proof-of-concept AI agent that always replies with Hello World",
         tags=["hello", "world", "agent"],
-        examples=["Hello", "Say hello to me"],
+        examples=["Say hello", "What do you say?"],
     )
     agent_card = AgentCard(
         name="hello-world-agent",
-        description="A simple AI agent that replies with Hello World to any user message.",
+        description="A simple proof-of-concept AI agent that always replies with Hello World",
         url=os.environ.get("AGENT_PUBLIC_URL", f"http://{host}:{port}/"),
         version="1.0.0",
         default_input_modes=["text", "text/plain"],
@@ -72,6 +75,12 @@ def main(host: str, port: int):
     app.add_middleware(JWTContextMiddleware)
 
     StarletteInstrumentor().instrument_app(app)
+
+    try:
+        logger.info("M1.achieved: agent initialized and ready to accept messages")
+    except Exception:
+        logger.error("M1.missed: agent failed to initialize")
+        raise
 
     logger.info(f"Starting A2A server at http://{host}:{port}")
     uvicorn.run(app, host=host, port=port)

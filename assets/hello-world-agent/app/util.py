@@ -5,6 +5,7 @@ Provides helper functions for enhancing MCP tool descriptions and metadata.
 """
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -21,8 +22,46 @@ _MCP_RETRY_DELAY = 4.0  # seconds
 # server would otherwise stall the request indefinitely and exhaust the worker
 # pool. Applied to each attempt individually (not the whole retry loop).
 MCP_CALL_TIMEOUT_SECONDS = float(os.environ.get("MCP_CALL_TIMEOUT_SECONDS", 30.0))
-# Maximum response size to prevent OOM - truncate responses larger than this
-MCP_MAX_RESPONSE_CHARS = int(os.environ.get("MCP_MAX_RESPONSE_CHARS", 100_000))
+# Maximum response size to prevent OOM and bound per-turn context cost — responses
+# larger than this are truncated. Kept modest by default because tool results are
+# re-sent on every subsequent turn; raise MCP_MAX_RESPONSE_CHARS for agents that
+# genuinely need large payloads.
+MCP_MAX_RESPONSE_CHARS = int(os.environ.get("MCP_MAX_RESPONSE_CHARS", 30_000))
+
+
+def minify_json(text: str) -> str:
+    """Return a whitespace-stripped form of ``text`` if it is valid JSON.
+
+    Pretty-printed JSON carries indentation and spacing that cost tokens on every
+    turn the result stays in context. Re-serializing with compact separators is
+    lossless and typically saves ~30%. Non-JSON input is returned
+    unchanged.
+    """
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
+
+
+def truncate_response(text: str, max_chars: int = MCP_MAX_RESPONSE_CHARS) -> str:
+    """Truncate ``text`` to ``max_chars``, cutting at a structural boundary.
+
+    A raw character cut can leave the model with a half-written JSON object or a
+    token split mid-word. When possible we back up to the last newline, comma, or
+    whitespace before the limit so the truncated output ends cleanly. A marker is
+    always appended so the model knows content was dropped.
+    """
+    if len(text) <= max_chars:
+        return text
+    window = text[:max_chars]
+    # Back up to the last clean boundary within the final 10% of the window so we
+    # never cut mid-token; fall back to the hard cut if none is found.
+    floor = int(max_chars * 0.9)
+    boundary = max(window.rfind("\n"), window.rfind(","), window.rfind(" "))
+    if boundary >= floor:
+        window = window[:boundary]
+    return window + "\n...[truncated]"
 
 
 def _is_retryable_error(exc: Exception) -> bool:
@@ -216,13 +255,19 @@ async def call_mcp_tool_with_retry(agw_client: Any, mcp_tool: Any, user_token: s
                 )
                 result = ""
 
-            # Truncate large responses to prevent OOM
+            # Minify JSON payloads before they enter context — lossless, and the
+            # result is re-sent on every subsequent turn. Non-JSON is
+            # returned unchanged.
+            result = minify_json(result)
+
+            # Truncate large responses to prevent OOM and bound per-turn context
+            # cost, cutting at a structural boundary rather than mid-token.
             if len(result) > MCP_MAX_RESPONSE_CHARS:
                 logger.warning(
                     f"call_mcp_tool_with_retry: Response from {mcp_tool.name} truncated from "
-                    f"{len(result)} to {MCP_MAX_RESPONSE_CHARS} chars to prevent OOM"
+                    f"{len(result)} to ~{MCP_MAX_RESPONSE_CHARS} chars to prevent OOM"
                 )
-                result = result[:MCP_MAX_RESPONSE_CHARS] + "\n...[truncated]"
+                result = truncate_response(result, MCP_MAX_RESPONSE_CHARS)
 
             logger.info(
                 f"MCP tool '{mcp_tool.name}' returned successfully (response length: {len(result)} chars)"

@@ -1,6 +1,6 @@
 # Hello World Agent
 
-A simple AI agent that replies with Hello World to any user message.
+A simple proof-of-concept AI agent that always replies with Hello World
 
 ## Overview
 
