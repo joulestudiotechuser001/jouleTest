@@ -53,26 +53,15 @@ def get_temperature() -> float:
 def thread_ttl_seconds() -> int:
     return 3600 # 1 hour
 
-@agent_config(
-    key="config.summarization.trigger_tokens",
-    label="Summarization Trigger (tokens)",
-    description="Summarize conversation history once it exceeds this many tokens. "
-                "History is NOT covered by prompt caching, so a high trigger means "
-                "the full raw transcript is re-sent on every turn until it fires. "
-                "Lower this to bound per-turn cost; raise it to keep more raw context.",
-)
-def summarization_trigger_tokens() -> int:
-    return 30_000
+SUMMARIZATION_TRIGGER_TOKENS = 30_000
 
-@agent_model(
-    key="config.summarization.model",
-    label="Summarization Model",
-    description="Model used to summarize conversation history. Summarization is a "
-                "cheaper task than the agent's own reasoning, so a smaller/faster "
-                "model is used here to reduce cost.",
-)
+def summarization_trigger_tokens() -> int:
+    return SUMMARIZATION_TRIGGER_TOKENS
+
+SUMMARIZATION_MODEL_NAME = "sap/anthropic--claude-4.5-haiku"
+
 def get_summarization_model_name() -> str:
-    return "sap/anthropic--claude-4.5-haiku"
+    return SUMMARIZATION_MODEL_NAME
 
 @prompt_section(
     key="prompts.system",
@@ -81,7 +70,9 @@ def get_summarization_model_name() -> str:
     validation={"format": "markdown", "max_length": 5000},
 )
 def get_system_prompt() -> str:
-    return """You are a Hello World agent. Respond to every user message with exactly: Hello World"""
+    return """You are a simple AI agent. Always reply with exactly 'Hello World' to any message, with no additional text.
+
+IMPORTANT: You MUST use tools to retrieve live data. Never fabricate, guess, or invent data. Relay tool errors verbatim without adding suggestions."""
 
 
 @dataclass
@@ -192,42 +183,49 @@ class SampleAgent:
         query: str,
         context_id: str,
         tools: Sequence[BaseTool] | None = None,
-    ) -> dict:
-        """Run the agent and return the final result with milestone instrumentation."""
-        # M1: Message Received
-        with tracer.start_as_current_span("M1_message_received"):
-            logger.info("M1.achieved: user message received")
-        # M2: Message Processed
-        with tracer.start_as_current_span("M2_message_processed"):
-            system_prompt = get_system_prompt()
-            tool_names = [tool.name for tool in tools] if tools else []
-            logger.info("Running agent with %d tool(s): %s", len(tool_names), tool_names)
-            extra: list = []
-            if not tools:
-                extra.append(
-                    SystemMessage(
-                        content="IMPORTANT: No tools are currently available. "
-                        "Do not attempt to call any tools. Respond to the user "
-                        "explaining that tools are temporarily unavailable."
-                    )
-                )
+    ) -> str:
+        """Core agent execution with full business instrumentation.
+
+        Milestones:
+          M2: Message received
+          M3: Response generated
+        """
+        # M2: Message received
+        with tracer.start_as_current_span("M2-message-received"):
             try:
-                result = await self._invoke_with_fallback(
-                    tools=tools or [],
-                    system_prompt=system_prompt,
-                    query=query,
-                    context_id=context_id,
-                    extra_messages=extra or None,
-                )
-                logger.info("M2.achieved: message processed successfully")
+                logger.info("M2.achieved: user message received")
             except Exception:
-                logger.error("M2.missed: message processing failed")
+                logger.warning("M2.missed: no message received or message parse failed")
                 raise
-        # M3: Response Sent
-        with tracer.start_as_current_span("M3_response_sent"):
+
+        system_prompt = get_system_prompt()
+        tool_names = [tool.name for tool in tools] if tools else []
+        logger.info("Running agent with %d tool(s): %s", len(tool_names), tool_names)
+
+        extra: list = []
+        if not tools:
+            extra.append(
+                SystemMessage(
+                    content="IMPORTANT: No tools are currently available. "
+                    "Do not attempt to call any tools. Respond to the user "
+                    "explaining that tools are temporarily unavailable."
+                )
+            )
+
+        result = await self._invoke_with_fallback(
+            tools=tools or [],
+            system_prompt=system_prompt,
+            query=query,
+            context_id=context_id,
+            extra_messages=extra or None,
+        )
+
+        # M3: Response generated
+        with tracer.start_as_current_span("M3-response-generated"):
             response = result["messages"][-1].content
-            logger.info("M3.achieved: Hello World response sent")
-        return {"response": response}
+            logger.info("M3.achieved: Hello World response generated")
+
+        return response
 
     async def stream(
         self,
@@ -255,16 +253,19 @@ class SampleAgent:
         }
 
         try:
-            result = await self._run_agent(query, context_id, tools=tools)
+            response = await self._run_agent(query, context_id, tools)
+
+            # M4: Response delivered
+            logger.info("M4.achieved: response delivered to caller")
             yield {
                 "is_task_complete": True,
                 "require_user_input": False,
-                "content": result["response"],
+                "content": response,
             }
 
         except Exception:
             logger.exception("Agent stream() failed")
-            logger.error("M3.missed: response was not sent")
+            logger.warning("M4.missed: response delivery failed")
             yield {
                 "is_task_complete": True,
                 "require_user_input": False,
