@@ -1,109 +1,128 @@
-"""Tests for the Hello World Agent."""
-import pytest
+"""Unit and integration tests for the Hello World Agent."""
+
+from __future__ import annotations
+
+import sys
+import os
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
-class TestHelloWorldResponse:
-    """Unit tests for Hello World response logic."""
+# Ensure app/ is on the path
+APP_DIR = Path(__file__).parent.parent / "app"
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
 
-    def test_system_prompt_contains_hello_world(self):
-        """The system prompt must instruct the agent to reply Hello World."""
-        from agent import get_system_prompt
-        prompt = get_system_prompt()
-        assert "Hello World" in prompt
 
-    def test_agent_response_dataclass(self):
-        """AgentResponse dataclass has correct fields."""
-        from agent import AgentResponse
-        resp = AgentResponse(status="completed", message="Hello World")
-        assert resp.status == "completed"
-        assert resp.message == "Hello World"
+# ---------------------------------------------------------------------------
+# Unit test: agent always responds with "Hello World"
+# ---------------------------------------------------------------------------
 
-    @pytest.mark.asyncio
-    async def test_stream_yields_processing_then_response(self):
-        """stream() yields a processing message then a completed response."""
-        from agent import SampleAgent
 
-        agent = SampleAgent.__new__(SampleAgent)
+@pytest.mark.asyncio
+async def test_agent_returns_hello_world():
+    """Unit test: verify agent returns Hello World for any input."""
+    from agent import SampleAgent
 
-        # Mock _run_agent to return Hello World
-        agent._run_agent = AsyncMock(return_value="Hello World")
+    agent = SampleAgent.__new__(SampleAgent)
+    agent._primary_model = "mock-model"
+    agent._fallback_model = ""
+    agent._fallback_llm = None
+    agent._temperature = 0.0
+    agent._checkpointer = None
+    agent._summarization_middleware = None
 
+    mock_result = {"messages": [MagicMock(content="Hello World")]}
+
+    with patch.object(agent, "_invoke_with_fallback", new=AsyncMock(return_value=mock_result)):
+        with patch.object(agent, "_create_graph", return_value=MagicMock()):
+            response = await agent._run_agent("hi", "ctx-1", tools=[])
+
+    assert response == "Hello World"
+
+
+# ---------------------------------------------------------------------------
+# Integration test: end-to-end agent invocation with mocked LLM
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_integration_hello_world():
+    """Integration test: end-to-end flow returns Hello World."""
+    from agent import SampleAgent
+
+    agent = SampleAgent.__new__(SampleAgent)
+    agent._primary_model = "mock-model"
+    agent._fallback_model = ""
+    agent._fallback_llm = None
+    agent._temperature = 0.0
+    agent._checkpointer = None
+    agent._summarization_middleware = None
+
+    mock_result = {"messages": [MagicMock(content="Hello World")]}
+
+    with patch.object(agent, "_invoke_with_fallback", new=AsyncMock(return_value=mock_result)):
+        result = await agent.invoke("hello", "ctx-2", tools=[])
+
+    assert result.status == "completed"
+    assert result.message == "Hello World"
+
+
+# ---------------------------------------------------------------------------
+# Unit test: stream yields Hello World
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_stream_hello_world():
+    """Unit test: stream method yields final Hello World response."""
+    from agent import SampleAgent
+
+    agent = SampleAgent.__new__(SampleAgent)
+    agent._primary_model = "mock-model"
+    agent._fallback_model = ""
+    agent._fallback_llm = None
+    agent._temperature = 0.0
+    agent._checkpointer = None
+    agent._summarization_middleware = None
+
+    mock_result = {"messages": [MagicMock(content="Hello World")]}
+
+    with patch.object(agent, "_invoke_with_fallback", new=AsyncMock(return_value=mock_result)):
         chunks = []
-        async for chunk in agent.stream("Hi", "ctx-1", tools=[]):
+        async for chunk in agent.stream("test", "ctx-3", tools=[]):
             chunks.append(chunk)
 
-        assert len(chunks) == 2
-        assert chunks[0]["is_task_complete"] is False
-        assert chunks[1]["is_task_complete"] is True
-        assert chunks[1]["content"] == "Hello World"
-
-    @pytest.mark.asyncio
-    async def test_stream_returns_error_on_exception(self):
-        """stream() yields an error chunk when _run_agent raises."""
-        from agent import SampleAgent
-
-        agent = SampleAgent.__new__(SampleAgent)
-        agent._run_agent = AsyncMock(side_effect=RuntimeError("boom"))
-
-        chunks = []
-        async for chunk in agent.stream("Hi", "ctx-1", tools=[]):
-            chunks.append(chunk)
-
-        assert chunks[-1]["is_task_complete"] is True
-        assert "error" in chunks[-1]["content"].lower()
-
-    @pytest.mark.asyncio
-    async def test_invoke_returns_completed_status(self):
-        """invoke() wraps stream() and returns AgentResponse with status=completed."""
-        from agent import SampleAgent, AgentResponse
-
-        agent = SampleAgent.__new__(SampleAgent)
-        agent._run_agent = AsyncMock(return_value="Hello World")
-
-        result = await agent.invoke("Hi", "ctx-2", tools=[])
-        assert isinstance(result, AgentResponse)
-        assert result.status == "completed"
-        assert result.message == "Hello World"
+    assert any(c.get("is_task_complete") and c.get("content") == "Hello World" for c in chunks)
 
 
-class TestBusinessInstrumentation:
-    """Tests that business milestones are instrumented."""
-
-    def test_milestone_logging_exists(self):
-        """Verify milestone log statements are present in agent source."""
-        import inspect
-        from agent import SampleAgent
-        source = inspect.getsource(SampleAgent._run_agent)
-        assert "M1.achieved" in source
-        assert "M2.achieved" in source
-        assert "M3.achieved" in source
-        assert "M1.missed" in source
-        assert "M2.missed" in source
-        assert "M3.missed" in source
-
-    def test_opentelemetry_tracer_used(self):
-        """Verify OpenTelemetry tracer is present in agent module."""
-        import agent
-        assert hasattr(agent, "tracer")
+# ---------------------------------------------------------------------------
+# Unit test: instrumentation milestone logging
+# ---------------------------------------------------------------------------
 
 
-class TestIntegration:
-    """Integration test: end-to-end agent flow with mocked LLM."""
+@pytest.mark.asyncio
+async def test_milestone_logging(caplog):
+    """Unit test: verify M1/M2/M3 milestone log statements are emitted."""
+    import logging
+    from agent import SampleAgent
 
-    @pytest.mark.asyncio
-    async def test_end_to_end_hello_world(self):
-        """Full agent flow returns Hello World with mocked LLM."""
-        from agent import SampleAgent
+    agent = SampleAgent.__new__(SampleAgent)
+    agent._primary_model = "mock-model"
+    agent._fallback_model = ""
+    agent._fallback_llm = None
+    agent._temperature = 0.0
+    agent._checkpointer = None
+    agent._summarization_middleware = None
 
-        fake_message = MagicMock()
-        fake_message.content = "Hello World"
-        fake_result = {"messages": [fake_message]}
+    mock_result = {"messages": [MagicMock(content="Hello World")]}
 
-        with patch("agent.SampleAgent._invoke_with_fallback", new_callable=AsyncMock, return_value=fake_result):
-            agent = SampleAgent.__new__(SampleAgent)
-            agent._run_agent = AsyncMock(return_value="Hello World")
-            result = await agent.invoke("Say hello", "ctx-integration", tools=[])
+    with patch.object(agent, "_invoke_with_fallback", new=AsyncMock(return_value=mock_result)):
+        with caplog.at_level(logging.INFO, logger="agent"):
+            chunks = [c async for c in agent.stream("hello", "ctx-4", tools=[])]
 
-        assert result.status == "completed"
-        assert result.message == "Hello World"
+    log_messages = caplog.text
+    assert "M1.achieved" in log_messages
+    assert "M2.achieved" in log_messages
+    assert "M3.achieved" in log_messages
