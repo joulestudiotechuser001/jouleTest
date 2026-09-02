@@ -1,7 +1,6 @@
 import logging
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Literal, Sequence
-
 from opentelemetry import trace
 
 from langchain.agents import create_agent
@@ -55,7 +54,7 @@ def thread_ttl_seconds() -> int:
     return 3600 # 1 hour
 
 SUMMARIZATION_TRIGGER_TOKENS = 30_000
-SUMMARIZATION_MODEL_NAME = "sap/anthropic--claude-4.5-haiku"
+SUMMARIZATION_MODEL = "sap/anthropic--claude-4.5-haiku"
 
 @prompt_section(
     key="prompts.system",
@@ -64,7 +63,7 @@ SUMMARIZATION_MODEL_NAME = "sap/anthropic--claude-4.5-haiku"
     validation={"format": "markdown", "max_length": 5000},
 )
 def get_system_prompt() -> str:
-    return """You are a simple Hello World agent. Regardless of any input, always respond with exactly: Hello World"""
+    return """You always respond with exactly 'Hello World', regardless of what the user says. Do not add any other text."""
 
 
 @dataclass
@@ -112,7 +111,7 @@ class SampleAgent:
         # system prompt + tool schemas, marked cacheable via cache_control_injection_points
         # on self.llm — stays cacheable across all turns, summarized or not.
         summarization_llm = ChatLiteLLM(
-            model=SUMMARIZATION_MODEL_NAME, temperature=0.0
+            model=SUMMARIZATION_MODEL, temperature=0.0
         )
         self._summarization_middleware = SummarizationMiddleware(
             model=summarization_llm,
@@ -174,40 +173,57 @@ class SampleAgent:
         self,
         query: str,
         context_id: str,
-        tools: Sequence[BaseTool] | None = None,
+        tools: Sequence[BaseTool],
     ) -> str:
-        """Core agent logic extracted from stream() to allow proper OTel instrumentation.
+        """Core agent logic with business step instrumentation.
 
-        Returns:
-            The agent's response text.
+        Returns the agent's response string.
         """
-        with tracer.start_as_current_span("hello-world-agent.respond"):
-            system_prompt = get_system_prompt()
-            tool_names = [tool.name for tool in tools] if tools else []
-            logger.info("Running agent with %d tool(s): %s", len(tool_names), tool_names)
+        # M1: Agent receives message
+        with tracer.start_as_current_span("M1.agent_receives_message"):
+            if query:
+                logger.info("M1.achieved: agent received incoming message")
+            else:
+                logger.warning("M1.missed: no message received or handler not invoked")
 
-            extra: list = []
-            if not tools:
-                extra.append(
-                    SystemMessage(
-                        content="IMPORTANT: No tools are currently available. "
-                        "Do not attempt to call any tools. Respond to the user "
-                        "explaining that tools are temporarily unavailable."
+        # M2: Agent processes request
+        with tracer.start_as_current_span("M2.agent_processes_request"):
+            try:
+                system_prompt = get_system_prompt()
+                tool_names = [tool.name for tool in tools]
+                logger.info("Running agent with %d tool(s): %s", len(tool_names), tool_names)
+
+                extra: list = []
+                if not tools:
+                    extra.append(
+                        SystemMessage(
+                            content="IMPORTANT: No tools are currently available. "
+                            "Do not attempt to call any tools. Respond to the user "
+                            "explaining that tools are temporarily unavailable."
+                        )
                     )
+
+                result = await self._invoke_with_fallback(
+                    tools=tools,
+                    system_prompt=system_prompt,
+                    query=query,
+                    context_id=context_id,
+                    extra_messages=extra or None,
                 )
+                logger.info("M2.achieved: agent processed request successfully")
+            except Exception:
+                logger.warning("M2.missed: agent failed to process request")
+                raise
 
-            # M2: Hello World logic is about to execute
-            logger.info("[M2.achieved]: hello world response logic implemented")
-
-            result = await self._invoke_with_fallback(
-                tools=tools or [],
-                system_prompt=system_prompt,
-                query=query,
-                context_id=context_id,
-                extra_messages=extra or None,
-            )
+        # M3: Agent replies Hello World
+        with tracer.start_as_current_span("M3.agent_replies"):
             response = result["messages"][-1].content
-            return response
+            if "Hello World" in response:
+                logger.info("M3.achieved: agent replied with Hello World")
+            else:
+                logger.warning("M3.missed: agent did not reply with Hello World")
+
+        return response
 
     async def stream(
         self,
@@ -228,9 +244,6 @@ class SampleAgent:
             - require_user_input: Whether user input is needed
             - content: The response content or status message
         """
-        # M1: Agent is bootstrapped and processing begins
-        logger.info("[M1.achieved]: agent project bootstrapped successfully")
-
         yield {
             "is_task_complete": False,
             "require_user_input": False,
@@ -238,11 +251,7 @@ class SampleAgent:
         }
 
         try:
-            response = await self._run_agent(query, context_id, tools=tools)
-
-            # M3: Tests passing milestone is logged at runtime when agent succeeds
-            logger.info("[M3.achieved]: all tests passed")
-
+            response = await self._run_agent(query, context_id, tools or [])
             yield {
                 "is_task_complete": True,
                 "require_user_input": False,
@@ -251,7 +260,6 @@ class SampleAgent:
 
         except Exception:
             logger.exception("Agent stream() failed")
-            logger.error("[M3.missed]: one or more tests failed")
             yield {
                 "is_task_complete": True,
                 "require_user_input": False,
